@@ -30,8 +30,8 @@ Write native Typst:
 
 - Native Typst math inside ~#(...#)~ and ~#[...#]~ boundaries.
 - LaTeX ~$...$~ fragments remain untouched and can coexist in the same file.
-- Drop-in command behavior for ~org-latex-preview~, including its prefix
-  arguments and the standard ~C-c C-x C-l~ binding.
+- Shared ~C-c C-x C-l~ binding for Typst and LaTeX, preserving
+  ~org-latex-preview~ behavior and prefix arguments.
 - Fully asynchronous rendering with a configurable concurrency limit.
 - Content-addressed SVG cache and coalescing of identical in-flight jobs.
 - Stale-result protection when a formula changes before compilation finishes.
@@ -82,16 +82,17 @@ On Emacs 29 or newer:
 
 * Usage
 
-Enable ~org-typst-preview-mode~ in an Org buffer.  The usual Org command now
-uses Typst:
+Enable ~org-typst-preview-mode~ in an Org buffer.  The usual Org command
+previews both Typst and LaTeX.  At point, it uses the renderer for that
+formula; region, section, and whole-buffer requests handle both languages:
 
 | Input                  | Action                         |
 |------------------------+--------------------------------|
-| ~C-c C-x C-l~          | Toggle formula at point        |
-| ~C-c C-x C-l~          | Preview the active region      |
-| ~C-u C-c C-x C-l~      | Clear the current section      |
-| ~C-u C-u C-c C-x C-l~  | Preview the whole buffer       |
-| ~C-u C-u C-u ...~      | Clear the whole buffer         |
+| ~C-c C-x C-l~          | Toggle Typst or LaTeX at point  |
+| ~C-c C-x C-l~          | Preview region or section      |
+| ~C-u C-c C-x C-l~      | Clear region or section        |
+| ~C-u C-u C-c C-x C-l~  | Preview both in the buffer     |
+| ~C-u C-u C-u ...~      | Clear both in the buffer       |
 
 The following commands are also available:
 
@@ -101,8 +102,8 @@ The following commands are also available:
 - ~M-x org-typst-preview-show-errors~
 
 Completed previews use Org's ~org-latex-overlay~ type.  Consequently,
-~org-clear-latex-preview~ can clear them too when called outside the minor-mode
-command remapping.
+~org-clear-latex-preview~ clears both kinds of preview and is not remapped by
+the minor mode.  Use ~org-typst-preview-clear~ to clear only Typst previews.
 
 * Configuration
 

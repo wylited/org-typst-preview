@@ -30,10 +30,11 @@
 ;; `org-latex-preview'.  Inline formulae use `#(...#)' and display formulae use
 ;; `#[...#]', so Typst and LaTeX can coexist in one Org document.
 ;;
-;; `org-typst-preview-mode' remaps Org's preview commands, preserves the usual
-;; `C-c C-x C-l' behavior, and expands Typst boundaries when exporting through
-;; a Typst backend.  Rendering uses asynchronous Typst processes, Org's color
-;; and cache settings, and Org's formula overlay conventions.
+;; `org-typst-preview-mode' extends Org's preview commands to handle Typst
+;; alongside LaTeX with `C-c C-x C-l', and expands Typst boundaries when
+;; exporting through a Typst backend.  Rendering uses asynchronous Typst
+;; processes, Org's color and cache settings, and Org's formula overlay
+;; conventions.
 
 ;;; Code:
 
@@ -405,27 +406,25 @@ Nil reuses the `:scale' value in `org-format-latex-options'."
 
 ;;;###autoload
 (defun org-typst-preview (&optional argument)
-  "Toggle Typst previews using `org-latex-preview' prefix ARGUMENT semantics.
+  "Toggle Typst and LaTeX previews with Org's prefix ARGUMENT semantics.
 
-One universal prefix clears the current section, two preview the whole buffer,
-and three clear the whole buffer."
+At point, toggle the Typst or LaTeX formula there.  With an active region,
+preview both kinds of formula in the region; otherwise preview the section.
+One universal prefix clears the region or current section, two preview the
+whole buffer, and three clear the whole buffer.  LaTeX previews are handled
+by `org-latex-preview'."
   (interactive "P")
   (cond
    ((not (display-graphic-p)) nil)
    ((and untrusted-content (not org--latex-preview-when-risky)) nil)
-   ((equal argument '(64))
-    (org-typst-preview-clear)
-    (message "Typst previews removed from buffer"))
+   ((member argument '((4) (64)))
+    (org-latex-preview argument))
    ((equal argument '(16))
+    (org-latex-preview argument)
     (message "%d Typst previews requested"
              (org-typst-preview--preview-region (point-min) (point-max))))
-   ((equal argument '(4))
-    (pcase-let ((`(,begin ,end)
-                 (if (use-region-p)
-                     (list (region-beginning) (region-end))
-                   (org-typst-preview--section-bounds))))
-      (org-typst-preview-clear begin end)))
    ((use-region-p)
+    (org-latex-preview argument)
     (message "%d Typst previews requested"
              (org-typst-preview--preview-region
               (region-beginning) (region-end))))
@@ -437,7 +436,11 @@ and three clear the whole buffer."
           (org-check-external-command org-typst-preview-executable)
           (org-typst-preview--schedule fragment))
         t)))
+   ((org-element-type-p (org-element-context)
+                        '(latex-environment latex-fragment))
+    (org-latex-preview argument))
    (t
+    (org-latex-preview argument)
     (pcase-let ((`(,begin ,end) (org-typst-preview--section-bounds)))
       (message "%d Typst previews requested"
                (org-typst-preview--preview-region begin end))))))
@@ -463,12 +466,11 @@ and three clear the whole buffer."
   (let ((map (make-sparse-keymap)))
     (define-key map [remap org-latex-preview] #'org-typst-preview)
     (define-key map [remap org-toggle-latex-fragment] #'org-typst-preview)
-    (define-key map [remap org-clear-latex-preview] #'org-typst-preview-clear)
     map))
 
 ;;;###autoload
 (define-minor-mode org-typst-preview-mode
-  "Use Typst for Org's formula preview commands and Typst export."
+  "Preview Typst alongside LaTeX with Org's commands and enable Typst export."
   :lighter " Typst∑"
   :keymap org-typst-preview-mode-map
   (if org-typst-preview-mode

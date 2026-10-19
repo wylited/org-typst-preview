@@ -7,6 +7,22 @@
 (require 'ert)
 (require 'org-typst-preview)
 
+(defmacro org-typst-preview-test--with-renderers (&rest body)
+  "Run BODY recording renderer requests in `latex-regions' and `typst-fragments'."
+  (declare (indent 0) (debug t))
+  `(let (latex-regions typst-fragments)
+     (cl-letf (((symbol-function 'display-graphic-p)
+                (lambda (&optional _display) t))
+               ((symbol-function 'org-check-external-command) #'ignore)
+               ((symbol-function 'org--latex-preview-region)
+                (lambda (begin end)
+                  (push (list begin end) latex-regions)))
+               ((symbol-function 'org-typst-preview--schedule)
+                (lambda (fragment)
+                  (push fragment typst-fragments)
+                  'scheduled)))
+       ,@body)))
+
 (ert-deftest org-typst-preview-parses-boundaries ()
   (with-temp-buffer
     (org-mode)
@@ -66,10 +82,133 @@
     (org-typst-preview-mode 1)
     (should (eq (command-remapping 'org-latex-preview)
                 'org-typst-preview))
-    (should (eq (command-remapping 'org-clear-latex-preview)
-                'org-typst-preview-clear))
+    (should-not (command-remapping 'org-clear-latex-preview))
     (should (memq #'org-typst-preview--export-before-parsing
-                  org-export-before-parsing-functions))))
+                  org-export-before-parsing-functions))
+    (org-typst-preview-mode -1)
+    (should (eq (key-binding (kbd "C-c C-x C-l")) 'org-latex-preview))
+    (should-not (memq #'org-typst-preview--export-before-parsing
+                      org-export-before-parsing-functions))))
+
+(ert-deftest org-typst-preview-key-previews-latex-at-point ()
+  (dolist (formula '("$x^2$" "\\(x^2\\)" "\\[x^2\\]"
+                     "\\begin{equation}\nx^2\n\\end{equation}"))
+    (with-temp-buffer
+      (org-mode)
+      (org-typst-preview-mode 1)
+      (insert "Before #(y#).\n\n" formula "\n\nAfter #(z#).")
+      (search-backward formula)
+      (forward-char 2)
+      (let* ((datum (org-element-context))
+             (bounds (list (org-element-begin datum) (org-element-end datum))))
+        (org-typst-preview-test--with-renderers
+          (call-interactively (key-binding (kbd "C-c C-x C-l")))
+          (should (equal latex-regions (list bounds)))
+          (should-not typst-fragments))))))
+
+(ert-deftest org-typst-preview-key-previews-typst-at-point ()
+  (with-temp-buffer
+    (org-mode)
+    (org-typst-preview-mode 1)
+    (insert "$x$\n\n#(y#)\n\n$z$")
+    (search-backward "y")
+    (org-typst-preview-test--with-renderers
+      (call-interactively (key-binding (kbd "C-c C-x C-l")))
+      (should-not latex-regions)
+      (should (equal (mapcar (lambda (fragment) (plist-get fragment :body))
+                             typst-fragments)
+                     '("y"))))))
+
+(ert-deftest org-typst-preview-key-previews-both-in-section ()
+  (with-temp-buffer
+    (org-mode)
+    (org-typst-preview-mode 1)
+    (insert "* First\nText.\n$x$\n#(y#)\n* Second\n$z$\n#(w#)")
+    (let ((end (save-excursion (search-backward "* Second"))))
+      (goto-char (point-min))
+      (search-forward "Text.")
+      (org-typst-preview-test--with-renderers
+        (call-interactively (key-binding (kbd "C-c C-x C-l")))
+        (should (equal latex-regions (list (list (point-min) end))))
+        (should (equal (mapcar (lambda (fragment) (plist-get fragment :body))
+                               typst-fragments)
+                       '("y")))))))
+
+(ert-deftest org-typst-preview-key-previews-both-in-region ()
+  (with-temp-buffer
+    (org-mode)
+    (org-typst-preview-mode 1)
+    (insert "$before$\n#(before#)\n\n$x$\n#(y#)\n\n$after$\n#(after#)")
+    (let* ((begin (save-excursion (search-backward "$x$")))
+           (end (save-excursion (search-backward "$after$")))
+           (transient-mark-mode t))
+      (goto-char end)
+      (set-mark begin)
+      (setq mark-active t)
+      (org-typst-preview-test--with-renderers
+        (call-interactively (key-binding (kbd "C-c C-x C-l")))
+        (should (equal latex-regions (list (list begin end))))
+        (should (equal (mapcar (lambda (fragment) (plist-get fragment :body))
+                               typst-fragments)
+                       '("y")))))))
+
+(ert-deftest org-typst-preview-key-previews-both-in-buffer ()
+  (dolist (active-region '(nil t))
+    (with-temp-buffer
+      (org-mode)
+      (org-typst-preview-mode 1)
+      (insert "$x$\n#(y#)\n* Next\n$z$\n#(w#)")
+      (goto-char (point-min))
+      (let ((transient-mark-mode t)
+            (current-prefix-arg '(16)))
+        (when active-region
+          (set-mark (point))
+          (forward-char 3)
+          (setq mark-active t))
+        (org-typst-preview-test--with-renderers
+          (call-interactively (key-binding (kbd "C-c C-x C-l")))
+          (should (equal latex-regions
+                         (list (list (point-min) (point-max)))))
+          (should (equal (mapcar (lambda (fragment) (plist-get fragment :body))
+                                 (reverse typst-fragments))
+                         '("y" "w"))))))))
+
+(ert-deftest org-typst-preview-key-clears-both-kinds-of-preview ()
+  (dolist (scope '(section region buffer))
+    (with-temp-buffer
+      (org-mode)
+      (org-typst-preview-mode 1)
+      (insert "* First\n$x$\n#(y#)\n* Second\n$z$\n#(w#)")
+      (let* ((fragments (org-typst-preview--fragments (point-min) (point-max)))
+             (typst-overlays (mapcar #'org-typst-preview--make-overlay fragments))
+             (latex-overlays
+              (mapcar (lambda (formula)
+                        (goto-char (point-min))
+                        (search-forward formula)
+                        (let ((overlay (make-overlay (- (point) (length formula))
+                                                      (point))))
+                          (overlay-put overlay 'org-overlay-type 'org-latex-overlay)
+                          overlay))
+                      '("$x$" "$z$")))
+             (transient-mark-mode t)
+             (current-prefix-arg (if (eq scope 'buffer) '(64) '(4))))
+        (goto-char (point-min))
+        (when (eq scope 'region)
+          (set-mark (point))
+          (goto-char (plist-get (car fragments) :end))
+          (setq mark-active t))
+        (org-typst-preview-test--with-renderers
+          (call-interactively (key-binding (kbd "C-c C-x C-l")))
+          (should-not latex-regions)
+          (should-not typst-fragments))
+        (should-not (overlay-buffer (car latex-overlays)))
+        (should-not (overlay-buffer (car typst-overlays)))
+        (if (eq scope 'buffer)
+            (progn
+              (should-not (overlay-buffer (cadr latex-overlays)))
+              (should-not (overlay-buffer (cadr typst-overlays))))
+          (should (overlay-buffer (cadr latex-overlays)))
+          (should (overlay-buffer (cadr typst-overlays))))))))
 
 (ert-deftest org-typst-preview-expands-typst-export-boundaries ()
   (with-temp-buffer
