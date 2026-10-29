@@ -29,6 +29,7 @@ Write native Typst:
 * Features
 
 - Native Typst math inside ~#(...#)~ and ~#[...#]~ boundaries.
+- Optional dollar mode that treats ~$...$~ fragments as native Typst math.
 - LaTeX ~$...$~ fragments remain untouched and can coexist in the same file.
 - Shared ~C-c C-x C-l~ binding for Typst and LaTeX, preserving
   ~org-latex-preview~ behavior and prefix arguments.
@@ -160,6 +161,50 @@ Prefix an opening boundary with a backslash when it should remain literal:
 ~\#(not a formula#)~.  Boundaries inside Org source, example, export, code,
 verbatim, comment, property, and fixed-width content are ignored.
 
+* Dollar mode
+
+Enable ~org-typst-preview-dollar-mode~ to write native Typst math directly
+with dollar signs:
+
+#+begin_src emacs-lisp
+  (add-hook 'org-mode-hook #'org-typst-preview-dollar-mode)
+#+end_src
+
+The mode is self-contained, but enable ~org-typst-preview-mode~ or
+~org-typst-preview-auto-mode~ alongside it to get the preview commands and
+automatic re-rendering; the scanner picks dollar fragments up automatically.
+
+While the mode is enabled, ~$...$~ and ~$$...$$~ mean Typst, not LaTeX:
+~$$x^2$$~ and ~$ x^2 $~ are both display forms, and Typst's own spacing
+rule decides inline versus display inside the dollars.  Dollars mean
+Typst, ~\(...\)~ and ~\[...\]~ mean LaTeX, and ~#(...#)~ / ~#[...#]~ mean
+Typst regardless of the mode.
+
+| Input     | Meaning                                       |
+|-----------+-----------------------------------------------|
+| ~$x$~     | Inline Typst math                             |
+| ~$ x $~   | Display Typst math (whitespace inside edges)  |
+| ~$$x$$~   | Display Typst math (Org-classic)              |
+
+Two caveats: because Org does not parse ~$ x $~, the display form gets no
+font-lock highlighting, and multi-line display math is allowed.  LaTeX math
+remains available through ~\(...\)~, ~\[...\]~, and latex environments.
+
+When exporting, display math becomes a ~#+begin_export typst~ block and
+inline ~$x$~ is left for ox-typst to pass through, which its default
+conversion does verbatim.  Customizing ~org-typst-from-latex-fragment~
+away from the default will affect inline dollar math, since Org hands it
+over as an ordinary LaTeX fragment.
+
+* Rendering
+
+Display math (=$ x $=, =$$...$$=, =#[...#]=) renders centered on its own
+line; inline math (=$x$=, =#(...#)=) stays in the text flow.  By default the preview font
+size is derived from the default face's height (Typst renders 1pt as one
+logical pixel), so previews match the buffer text; set
+=org-typst-preview-font-size= to a number to pin it.  Previews follow
+=text-scale-adjust= (=C-x C-+= / =C-x C--=) scaling.
+
 * Export
 
 When ~org-typst-preview-mode~ is active, Typst export is handled automatically.
@@ -190,3 +235,4 @@ Integration tests are skipped when the Typst executable is unavailable.
 * License
 
 GPL-3.0-or-later.
+

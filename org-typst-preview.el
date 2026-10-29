@@ -66,10 +66,14 @@ Nil reuses `org-preview-latex-image-directory'."
   :group 'org-typst-preview
   :type 'string)
 
-(defcustom org-typst-preview-font-size 11.0
-  "Base preview font size in points."
+(defcustom org-typst-preview-font-size nil
+  "Base preview font size in points.
+Nil derives it from the default face's height at render time (Typst
+renders 1pt as one logical pixel, so the face's point size matches the
+surrounding text) and follows font and theme changes."
   :group 'org-typst-preview
-  :type 'number)
+  :type '(choice (const :tag "Match the default face height" nil)
+                 number))
 
 (defcustom org-typst-preview-font-family nil
   "Optional Typst font family for preview text."
@@ -119,6 +123,102 @@ Nil reuses the `:scale' value in `org-format-latex-options'."
 
 (defconst org-typst-preview--cache-version 3)
 
+;; Defined by `define-minor-mode' below; declared here for the scanner.
+(defvar org-typst-preview-dollar-mode)
+
+;; Typst treats `$ x $' (whitespace hugging the inner delimiters) as display
+;; math and `$x$' as inline math.  Org never parses the whitespace form, so it
+;; is matched with a dedicated regexp; the inline form reuses Org's canonical
+;; `$' fragment regexp from `org-latex-regexps'.
+(defconst org-typst-preview--dollar-display-regexp
+  "\\$[ \t\n][^$]*[ \t\n]\\$"
+  "Regexp matching Typst display math delimited by whitespace dollars.")
+
+(defun org-typst-preview--boundary-context-p ()
+  "Return non-nil when a Typst or dollar boundary may start at point."
+  (and (not (eq (char-before) ?\\))
+       (not (org-element-lineage
+             (org-element-context)
+             '(code comment comment-block example-block export-block
+                    fixed-width inline-src-block keyword node-property
+                    property-drawer src-block verbatim)
+             t))))
+
+(defun org-typst-preview--dollar-double-fragment (position &optional limit)
+  "Return the `$$...$$' display fragment starting at POSITION, or nil.
+LIMIT bounds the match, mirroring `re-search-forward' semantics.
+`$$body$$' compiles as `$ body $'."
+  (goto-char position)
+  (when (and (looking-at (or (nth 1 (assoc "$$" org-latex-regexps))
+                             "\\$\\$\\(?:.\\|\n\\)*?\\$\\$"))
+             (<= (match-end 0) (or limit (point-max))))
+    (let* ((end (match-end 0))
+           (body (string-trim (buffer-substring-no-properties
+                               (+ position 2) (- end 2)))))
+      (list :begin position
+            :end end
+            :body body
+            :value (concat "$ " body " $")
+            :block t :dollar t))))
+
+(defun org-typst-preview--dollar-display-fragment (position &optional limit)
+  "Return the display dollar fragment starting at POSITION, or nil.
+LIMIT bounds the match, mirroring `re-search-forward' semantics."
+  (goto-char position)
+  (when (and (looking-at org-typst-preview--dollar-display-regexp)
+             (<= (match-end 0) (or limit (point-max))))
+    (list :begin position
+          :end (match-end 0)
+          :body (buffer-substring-no-properties
+                 (+ position 2) (- (match-end 0) 2))
+          :value (buffer-substring-no-properties position (match-end 0))
+          :block t :dollar t)))
+
+(defun org-typst-preview--dollar-inline-fragment (position &optional limit)
+  "Return the inline dollar fragment starting at POSITION, or nil.
+
+Reuses Org's canonical `$' regexps (the single-character `$x$' entry
+and the general entry) so the fragment matches what Org recognizes.
+LIMIT bounds the match, mirroring `re-search-forward' semantics."
+  (let ((case-fold-search nil)
+        (entries '("$1" "$"))
+        fragment)
+    (while (and entries (not fragment))
+      (goto-char
+       (if (and (> position (point-min))
+                (not (memq (char-before position) '(?\\ ?\n ?$))))
+           (1- position)
+         position))
+      (when (and (looking-at (nth 1 (assoc (car entries) org-latex-regexps)))
+                 (= (match-beginning
+                     (nth 2 (assoc (car entries) org-latex-regexps)))
+                    position)
+                 (<= (match-end 2) (or limit (point-max))))
+        (setq fragment
+              (list :begin position
+                    :end (match-end 2)
+                    :body (buffer-substring-no-properties
+                           (1+ position) (1- (match-end 2)))
+                    :value (buffer-substring-no-properties
+                            position (match-end 2))
+                    :block nil :dollar t)))
+      (setq entries (cdr entries)))
+    fragment))
+
+(defun org-typst-preview--dollar-fragment-at (position &optional limit)
+  "Parse a native Typst dollar fragment beginning at POSITION.
+
+Return a fragment plist with the dollar text as `:value', `:block' set
+for the display forms and `:dollar' set for all forms.  LIMIT bounds
+the match, mirroring `re-search-forward' semantics."
+  (save-excursion
+    (goto-char position)
+    (when (and (eq (char-after) ?$)
+               (org-typst-preview--boundary-context-p))
+      (or (org-typst-preview--dollar-double-fragment position limit)
+          (org-typst-preview--dollar-display-fragment position limit)
+          (org-typst-preview--dollar-inline-fragment position limit)))))
+
 (defun org-typst-preview--fragment-at (position &optional limit)
   "Parse a Typst fragment beginning at POSITION, stopping before LIMIT."
   (save-excursion
@@ -128,14 +228,8 @@ Nil reuses the `:scale' value in `org-format-latex-options'."
            (block-p (equal opener "#["))
            (closer (cond ((equal opener "#(") "#)")
                          (block-p "#]"))))
-      (when (and closer
-                 (not (eq (char-before) ?\\))
-                 (not (org-element-lineage
-                       (org-element-context)
-                       '(code comment comment-block example-block export-block
-                              fixed-width inline-src-block keyword node-property
-                              property-drawer src-block verbatim)
-                       t)))
+      (or (when (and closer
+                     (org-typst-preview--boundary-context-p))
         (forward-char 2)
         (let (closing)
           (while (and (not closing)
@@ -152,14 +246,19 @@ Nil reuses the `:scale' value in `org-format-latex-options'."
                     :value (if block-p
                                (concat "$ " body " $")
                              (concat "$" body "$"))
-                    :block block-p))))))))
+                    :block block-p)))))
+          (when (and org-typst-preview-dollar-mode
+                     (eq (char-after position) ?$))
+            (org-typst-preview--dollar-fragment-at position limit))))))
 
 (defun org-typst-preview--fragment-at-point ()
   "Return the Typst fragment containing point."
   (let* ((origin (point))
          (fragment (org-typst-preview--fragment-at origin)))
     (save-excursion
-      (while (and (not fragment) (search-backward "#" nil t))
+      (while (and (not fragment)
+                  (re-search-backward
+                   (if org-typst-preview-dollar-mode "[#$]" "#") nil t))
         (when-let* ((candidate (org-typst-preview--fragment-at (point))))
           (when (<= (plist-get candidate :begin)
                     origin
@@ -172,13 +271,94 @@ Nil reuses the `:scale' value in `org-format-latex-options'."
   (let (fragments)
     (save-excursion
       (goto-char begin)
-      (while (re-search-forward (rx "#" (or "(" "[")) end t)
-        (when-let* ((fragment
-                     (org-typst-preview--fragment-at
-                      (match-beginning 0) end)))
-          (push fragment fragments)
-          (goto-char (plist-get fragment :end)))))
+      (while (re-search-forward
+              (if org-typst-preview-dollar-mode "#[([]\\|\\$" "#[([]")
+              end t)
+        (if (eq (char-after (match-beginning 0)) ?#)
+            (when-let* ((fragment
+                         (org-typst-preview--fragment-at
+                          (match-beginning 0) end)))
+              (push fragment fragments)
+              (goto-char (plist-get fragment :end)))
+          (when-let* ((fragment
+                       (org-typst-preview--dollar-fragment-at
+                        (match-beginning 0) end)))
+            (push fragment fragments)
+            (goto-char (plist-get fragment :end))))))
     (nreverse fragments)))
+
+(defun org-typst-preview--color-rgb (color fallback)
+  "Return a Typst rgb() call for COLOR, or FALLBACK if unresolvable.
+COLOR may be a color name, an RGB string, or an unspecified face
+attribute (e.g. \"unspecified-fg\" in frames before the theme loads);
+`color-values' returns nil for those, which must not yield rgb()."
+  (let ((values (and (stringp color) (color-values color))))
+    (if values
+        (format "rgb(%s)"
+                (mapconcat
+                 (lambda (component)
+                   (number-to-string (round (/ component 257.0))))
+                 values ","))
+      fallback)))
+(defvar text-scale-mode)
+(defvar text-scale-mode-step)
+(defvar text-scale-mode-amount)
+
+(defun org-typst-preview--font-size ()
+  "Typst font size in points for the current buffer.
+With a numeric `org-typst-preview-font-size', use it; otherwise derive
+from the default face's height: Typst renders 1pt as one logical
+pixel, so the face's point size matches the surrounding text."
+  (or (and (numberp org-typst-preview-font-size)
+           org-typst-preview-font-size)
+      (let ((height (face-attribute 'default :height nil 'default)))
+        (if (and (numberp height) (> height 0))
+            (/ height 10.0)
+          11.0))))
+
+(defun org-typst-preview--image-spec (file &optional rendered-height)
+  "Return an image spec for FILE, scaled like the surrounding text.
+RENDERED-HEIGHT is the font size (pt) FILE was rendered at; when the
+buffer's font has since changed, ratio-scale the image to match (SVGs
+stay crisp).  Also follows `text-scale-adjust'."
+  (let* ((base (or org-typst-preview-scale 1.0))
+         (zoom (if (and (boundp 'text-scale-mode) text-scale-mode
+                        (boundp 'text-scale-mode-step)
+                        (boundp 'text-scale-mode-amount))
+                   (expt text-scale-mode-step text-scale-mode-amount)
+                 1.0))
+         (ratio (if (and (numberp rendered-height)
+                         (cl-plusp rendered-height))
+                    (float (/ (org-typst-preview--font-size)
+                              rendered-height))
+                  1.0)))
+    (list 'image :type 'svg :file file :ascent 'center
+          :scale (* base zoom ratio))))
+
+(defun org-typst-preview--apply-image (overlay file)
+  "Make OVERLAY display FILE, remembering FILE and its render height."
+  (overlay-put overlay 'org-typst-preview-file file)
+  (overlay-put overlay 'org-typst-preview-rendered-height
+               (org-typst-preview--font-size))
+  (overlay-put overlay 'display
+               (org-typst-preview--image-spec
+                file (overlay-get overlay 'org-typst-preview-rendered-height))))
+
+(defun org-typst-preview--refresh-text-scale ()
+  "Rescale preview images after zoom or font-size changes.
+Runs from `text-scale-mode-hook' and `post-command-hook'; returns
+non-nil when any overlay was updated."
+  (let ((updated nil))
+    (dolist (overlay (org-typst-preview--overlays (point-min) (point-max)))
+      (when-let* ((file (overlay-get overlay 'org-typst-preview-file)))
+        (let ((spec (org-typst-preview--image-spec
+                     file
+                     (overlay-get overlay
+                                  'org-typst-preview-rendered-height))))
+          (unless (equal spec (overlay-get overlay 'display))
+            (overlay-put overlay 'display spec)
+            (setq updated t)))))
+    updated))
 
 (defun org-typst-preview--source (value face)
   "Return a complete Typst preview document for VALUE at FACE."
@@ -207,17 +387,10 @@ Nil reuses the `:scale' value in `org-format-latex-options'."
              org-typst-preview-page-margin
              (if (equal background "Transparent")
                  "none"
-               (format "rgb(%s)"
-                       (mapconcat
-                        (lambda (component)
-                          (number-to-string (round (/ component 257.0))))
-                        (color-values background) ","))))
-     (format "#set text(size: %.3fpt, fill: rgb(%s)%s)\n"
-             (* org-typst-preview-font-size scale)
-             (mapconcat
-              (lambda (component)
-                (number-to-string (round (/ component 257.0))))
-              (color-values foreground) ",")
+               (org-typst-preview--color-rgb background "none")))
+     (format "#set text(size: %.3fpt, fill: %s%s)\n"
+            (* (org-typst-preview--font-size) scale)
+             (org-typst-preview--color-rgb foreground "black")
              font)
      "#show math.equation: set text(top-edge: \"bounds\", bottom-edge: \"bounds\")\n"
      (unless (string-empty-p org-typst-preview-preamble)
@@ -231,18 +404,31 @@ Nil reuses the `:scale' value in `org-format-latex-options'."
    (overlays-in begin end)))
 
 (defun org-typst-preview--make-overlay (fragment &optional image)
-  "Create a preview overlay for FRAGMENT, displaying IMAGE when non-nil."
-  (let ((overlay (make-overlay (plist-get fragment :begin)
-                               (plist-get fragment :end))))
+  "Create a preview overlay for FRAGMENT, displaying IMAGE when non-nil.
+Display (block) fragments get their own line, centered."
+  (let* ((begin (plist-get fragment :begin))
+         (end (plist-get fragment :end))
+         (block (plist-get fragment :block))
+         (overlay (make-overlay begin end)))
     (overlay-put overlay 'org-overlay-type 'org-latex-overlay)
     (overlay-put overlay 'org-typst-preview t)
     (overlay-put overlay 'evaporate t)
     (overlay-put overlay 'modification-hooks
                  (list (lambda (changed _after _begin _end &optional _length)
                          (delete-overlay changed))))
+    (when block
+      ;; Put display math on its own line, centered: `(0.5 . image)'
+      ;; is half the width of the image that follows, so centering
+      ;; holds at any size, scale, or window width.
+      (overlay-put overlay 'before-string
+                   (concat
+                    (unless (save-excursion (goto-char begin) (bolp)) "\n")
+                    (propertize " " 'display
+                                '(space :align-to (- center (0.5 . image))))))
+      (overlay-put overlay 'after-string
+                   (unless (save-excursion (goto-char end) (eolp)) "\n")))
     (when image
-      (overlay-put overlay 'display
-                   (list 'image :type 'svg :file image :ascent 'center)))
+      (org-typst-preview--apply-image overlay image))
     overlay))
 
 (defun org-typst-preview--finish (process event)
@@ -252,38 +438,44 @@ Nil reuses the `:scale' value in `org-format-latex-options'."
            (success (and (eq (process-status process) 'exit)
                          (zerop (process-exit-status process))))
            (output (org-typst-preview--job-output job))
-           (process-buffer (process-buffer process)))
+           ;; The process buffer may already be gone; never fall back to
+           ;; killing or inserting into whatever buffer happens to be current.
+           (process-buffer (or (process-buffer process)
+                               (get-buffer-create " *org-typst-preview*"))))
       (condition-case error-data
           (when success
             (rename-file (org-typst-preview--job-render job) output t)
             (dolist (overlay (org-typst-preview--job-overlays job))
               (when (overlay-buffer overlay)
-                (overlay-put overlay 'display
-                             (list 'image :type 'svg :file output
-                                   :ascent 'center)))))
+                (org-typst-preview--apply-image overlay output))))
         (error
          (setq success nil)
          (with-current-buffer process-buffer
            (goto-char (point-max))
            (insert "\n" (error-message-string error-data) "\n"))))
-      (unless success
-        (mapc (lambda (overlay)
-                (when (overlay-buffer overlay) (delete-overlay overlay)))
-              (org-typst-preview--job-overlays job))
-        (when-let* ((old (get-buffer org-typst-preview-log-buffer)))
-          (kill-buffer old))
-        (with-current-buffer process-buffer
-          (goto-char (point-min))
-          (insert (format "%s\n\n" (string-trim event)))
-          (compilation-mode)
-          (rename-buffer org-typst-preview-log-buffer))
-        (display-warning 'org-typst-preview
-                         (format "Typst preview failed; see %s"
-                                 org-typst-preview-log-buffer)))
-      (when success (kill-buffer process-buffer))
-      (delete-file (org-typst-preview--job-input job))
-      (when (file-exists-p (org-typst-preview--job-render job))
-        (delete-file (org-typst-preview--job-render job)))
+      ;; Reporting must not prevent queue bookkeeping below.
+      (condition-case nil
+          (progn
+            (unless success
+              (mapc (lambda (overlay)
+                      (when (overlay-buffer overlay) (delete-overlay overlay)))
+                    (org-typst-preview--job-overlays job))
+              (when-let* ((old (get-buffer org-typst-preview-log-buffer)))
+                (kill-buffer old))
+              (with-current-buffer process-buffer
+                (goto-char (point-min))
+                (insert (format "%s\n\n" (string-trim event)))
+                (compilation-mode)
+                (rename-buffer org-typst-preview-log-buffer))
+              (display-warning 'org-typst-preview
+                               (format "Typst preview failed; see %s"
+                                       org-typst-preview-log-buffer)))
+            (when success (kill-buffer process-buffer)))
+        (error nil))
+      (ignore-errors
+        (delete-file (org-typst-preview--job-input job))
+        (when (file-exists-p (org-typst-preview--job-render job))
+          (delete-file (org-typst-preview--job-render job))))
       (remhash output org-typst-preview--jobs)
       (cl-decf org-typst-preview--running)
       (org-typst-preview--start-jobs))))
@@ -302,18 +494,37 @@ Nil reuses the `:scale' value in `org-format-latex-options'."
       (insert (org-typst-preview--job-source job)))
     (setf (org-typst-preview--job-input job) input
           (org-typst-preview--job-render job) render)
-    (let ((process
-           (make-process
-            :name (format "org-typst-preview-%s"
-                          (substring (sha1 output) 0 10))
-            :buffer process-buffer
-            :command (list org-typst-preview-executable
-                           "compile" "--format" "svg" input render)
-            :coding 'utf-8-unix
-            :noquery t
-            :sentinel #'org-typst-preview--finish)))
-      (process-put process 'org-typst-preview-job job)
-      (cl-incf org-typst-preview--running))))
+    ;; Run the compiler locally: the job directory is local even for remote
+    ;; files, so never let a remote `default-directory' send typst and the
+    ;; local temp paths to a remote host.
+    (let ((process nil))
+      (condition-case error-data
+          (let ((default-directory (org-typst-preview--job-directory job)))
+            (setq process
+                  (make-process
+                   :name (format "org-typst-preview-%s"
+                                 (substring (sha1 output) 0 10))
+                   :buffer process-buffer
+                   :command (list org-typst-preview-executable
+                                  "compile" "--format" "svg" input render)
+                   :coding 'utf-8-unix
+                   :noquery t
+                   :sentinel #'org-typst-preview--finish)))
+        (error
+         (remhash output org-typst-preview--jobs)
+         (delete-file input)
+         (dolist (ov (org-typst-preview--job-overlays job))
+           (when (overlay-buffer ov) (delete-overlay ov)))
+         (kill-buffer process-buffer)
+         (display-warning
+          'org-typst-preview
+          (format "Could not start %s: %s"
+                  org-typst-preview-executable
+                  (error-message-string error-data)))
+         (setq process nil)))
+      (when process
+        (process-put process 'org-typst-preview-job job)
+        (cl-incf org-typst-preview--running)))))
 
 (defun org-typst-preview--start-jobs ()
   "Start queued jobs up to `org-typst-preview-max-processes'."
@@ -336,7 +547,10 @@ Nil reuses the `:scale' value in `org-format-latex-options'."
         'existing
       (let* ((source (org-typst-preview--source
                       (plist-get fragment :value)
-                      (face-at-point begin)))
+                      ;; `face-at-point' has no default argument and returns
+                      ;; nil on unfontified text; `face-attribute' would then
+                      ;; signal "Invalid face" for `:foreground auto'.
+                      (or (face-at-point begin) 'default)))
              (directory
               (expand-file-name
                (or org-typst-preview-image-directory
@@ -405,6 +619,20 @@ Nil reuses the `:scale' value in `org-format-latex-options'."
     overlays))
 
 ;;;###autoload
+(defun org-typst-preview--delegate-latex (argument)
+  "Delegate ARGUMENT to `org-latex-preview', degrading on failure.
+
+A missing LaTeX toolchain (no latex/dvipng/dvisvgm) must not abort the
+shared command before the Typst half runs; surface a warning instead."
+  (condition-case err
+      (org-latex-preview argument)
+    (error
+     (display-warning
+      'org-typst-preview
+      (format "LaTeX preview skipped (%s); use \\(...\\) only if LaTeX is installed"
+              (error-message-string err)))
+     nil)))
+
 (defun org-typst-preview (&optional argument)
   "Toggle Typst and LaTeX previews with Org's prefix ARGUMENT semantics.
 
@@ -415,16 +643,25 @@ whole buffer, and three clear the whole buffer.  LaTeX previews are handled
 by `org-latex-preview'."
   (interactive "P")
   (cond
-   ((not (display-graphic-p)) nil)
+   ((not (display-graphic-p))
+    ;; Keep Org's LaTeX preview working on TTY instead of disabling it.
+    (org-latex-preview argument))
    ((and untrusted-content (not org--latex-preview-when-risky)) nil)
    ((member argument '((4) (64)))
-    (org-latex-preview argument))
+    (org-typst-preview--delegate-latex argument)
+    (if (equal argument '(64))
+        (org-typst-preview-clear)
+      (apply #'org-typst-preview-clear
+             (if (use-region-p)
+                 (list (region-beginning) (region-end))
+               (org-typst-preview--section-bounds))))
+    (message "Typst previews cleared"))
    ((equal argument '(16))
-    (org-latex-preview argument)
+    (org-typst-preview--delegate-latex argument)
     (message "%d Typst previews requested"
              (org-typst-preview--preview-region (point-min) (point-max))))
    ((use-region-p)
-    (org-latex-preview argument)
+    (org-typst-preview--delegate-latex argument)
     (message "%d Typst previews requested"
              (org-typst-preview--preview-region
               (region-beginning) (region-end))))
@@ -440,7 +677,7 @@ by `org-latex-preview'."
                         '(latex-environment latex-fragment))
     (org-latex-preview argument))
    (t
-    (org-latex-preview argument)
+    (org-typst-preview--delegate-latex argument)
     (pcase-let ((`(,begin ,end) (org-typst-preview--section-bounds)))
       (message "%d Typst previews requested"
                (org-typst-preview--preview-region begin end))))))
@@ -455,12 +692,22 @@ by `org-latex-preview'."
       (let ((begin (plist-get fragment :begin))
             (end (plist-get fragment :end))
             (value (plist-get fragment :value)))
-        (goto-char begin)
-        (delete-region begin end)
-        (if (plist-get fragment :block)
-            (insert "\n#+begin_export typst\n" value
-                    "\n#+end_export\n")
-          (insert "@@typst:" value "@@"))))))
+        (cond
+         ;; Inline dollar math survives ox-typst's DEFAULT conversion
+         ;; (`org-typst-from-latex-fragment' is naive by default: `$x$' is
+         ;; exported verbatim).  Custom settings that drop or LaTeX-convert
+         ;; fragments will treat Typst text accordingly; only the display
+         ;; form needs shielding (Org's script parser mangles bare `$ x $'),
+         ;; leave the text untouched.
+         ((and (plist-get fragment :dollar)
+               (not (plist-get fragment :block))))
+         (t
+          (goto-char begin)
+          (delete-region begin end)
+          (if (plist-get fragment :block)
+              (insert "\n#+begin_export typst\n" value
+                      "\n#+end_export\n")
+            (insert "@@typst:" value "@@"))))))))
 
 (defvar org-typst-preview-mode-map
   (let ((map (make-sparse-keymap)))
@@ -474,17 +721,31 @@ by `org-latex-preview'."
   :lighter " Typst∑"
   :keymap org-typst-preview-mode-map
   (if org-typst-preview-mode
-      (add-hook 'org-export-before-parsing-functions
-                #'org-typst-preview--export-before-parsing nil t)
+      (progn
+        (add-hook 'org-export-before-parsing-functions
+                  #'org-typst-preview--export-before-parsing nil t)
+        ;; Previews zoom with C-x C-+/C-x C-- and re-scale when the
+        ;; buffer font itself changes; the refresh early-outs when the
+        ;; computed spec is unchanged.
+        (add-hook 'text-scale-mode-hook
+                  #'org-typst-preview--refresh-text-scale nil t)
+        (add-hook 'post-command-hook
+                  #'org-typst-preview--refresh-text-scale nil t))
     (remove-hook 'org-export-before-parsing-functions
-                 #'org-typst-preview--export-before-parsing t)))
+                 #'org-typst-preview--export-before-parsing t)
+    (remove-hook 'text-scale-mode-hook
+                 #'org-typst-preview--refresh-text-scale t)
+    (remove-hook 'post-command-hook
+                 #'org-typst-preview--refresh-text-scale t)))
 
 (defun org-typst-preview--auto-run (buffer marker)
   "Preview the fragment near MARKER in BUFFER."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (setq org-typst-preview--auto-timer nil)
-      (when (bound-and-true-p org-typst-preview-auto-mode)
+      (when (and (bound-and-true-p org-typst-preview-auto-mode)
+                 (not (and untrusted-content
+                           (not org--latex-preview-when-risky))))
         (save-excursion
           (goto-char marker)
           (when-let* ((fragment (org-typst-preview--fragment-at-point)))
@@ -515,6 +776,21 @@ by `org-latex-preview'."
     (when org-typst-preview--auto-timer
       (cancel-timer org-typst-preview--auto-timer)
       (setq org-typst-preview--auto-timer nil))))
+
+;;;###autoload
+(define-minor-mode org-typst-preview-dollar-mode
+  "Treat Org `$...$' fragments as native Typst math.
+
+`$x$' (no whitespace inside the delimiters) is inline math and `$ x $'
+(whitespace inside both edges) is display math, exactly as Typst itself
+decides; the fragment text is passed to the compiler verbatim.  There is
+no `$$...$$' support.  While the mode is enabled, `$...$' means Typst,
+not LaTeX; LaTeX stays available through `\\(...\\)' and latex
+environments.  Enable `org-typst-preview-mode' or
+`org-typst-preview-auto-mode' alongside for preview commands."
+  :init-value nil
+  :lighter " Typst$"
+  :group 'org-typst-preview)
 
 ;;;###autoload
 (defun org-typst-preview-refresh-buffer ()

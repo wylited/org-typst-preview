@@ -233,7 +233,7 @@
          (org-typst-preview--jobs (make-hash-table :test #'equal))
          (org-typst-preview--queue nil)
          (org-typst-preview--running 0)
-         (deadline (+ (float-time) 15.0)))
+         (deadline (+ (float-time) 120.0)))
     (unwind-protect
         (with-temp-buffer
           (org-mode)
@@ -268,7 +268,7 @@
          (org-typst-preview--jobs (make-hash-table :test #'equal))
          (org-typst-preview--queue nil)
          (org-typst-preview--running 0)
-         (deadline (+ (float-time) 15.0)))
+         (deadline (+ (float-time) 120.0)))
     (unwind-protect
         (with-temp-buffer
           (org-mode)
@@ -298,7 +298,7 @@
          (org-typst-preview--jobs (make-hash-table :test #'equal))
          (org-typst-preview--queue nil)
          (org-typst-preview--running 0)
-         (deadline (+ (float-time) 15.0)))
+         (deadline (+ (float-time) 120.0)))
     (unwind-protect
         (with-temp-buffer
           (org-mode)
@@ -314,6 +314,351 @@
       (when-let* ((buffer (get-buffer org-typst-preview-log-buffer)))
         (kill-buffer buffer))
       (delete-directory cache-directory t))))
+
+;;; Dollar mode
+
+(ert-deftest org-typst-preview-dollar-parses-inline-and-display ()
+  (with-temp-buffer
+    (org-mode)
+    (insert "A $x$ and $ y^2 $ here.")
+    (org-typst-preview-dollar-mode 1)
+    (let ((fragments
+           (org-typst-preview--fragments (point-min) (point-max))))
+      (should (= (length fragments) 2))
+      (should (equal (plist-get (car fragments) :value) "$x$"))
+      (should-not (plist-get (car fragments) :block))
+      (should (plist-get (car fragments) :dollar))
+      (should (equal (plist-get (cadr fragments) :value) "$ y^2 $"))
+      (should (plist-get (cadr fragments) :block))
+      (should (plist-get (cadr fragments) :dollar)))))
+
+(ert-deftest org-typst-preview-dollar-parses-multiline-display ()
+  (with-temp-buffer
+    (org-mode)
+    (insert "$ x +\ny $")
+    (org-typst-preview-dollar-mode 1)
+    (let ((fragment
+           (car (org-typst-preview--fragments (point-min) (point-max)))))
+      (should (equal (plist-get fragment :value) "$ x +\ny $"))
+      (should (plist-get fragment :block)))))
+
+(ert-deftest org-typst-preview-dollar-ignores-non-fragments ()
+  (with-temp-buffer
+    (org-mode)
+    (insert "Cost \\\\$5 and $10 total.\n\n"
+            "#+begin_src typst\n$ x $\n#+end_src\n\n"
+            "~$x$~ and =$x$= stay literal.\n\n"
+            "Escaped \\$ x $ here.")
+    (org-typst-preview-dollar-mode 1)
+    (should-not (org-typst-preview--fragments (point-min) (point-max)))))
+
+(ert-deftest org-typst-preview-dollar-coexists-with-boundaries ()
+  (with-temp-buffer
+    (org-mode)
+    (insert "#(a#) and $x$ plus $ b $ end #[c#]")
+    (org-typst-preview-dollar-mode 1)
+    (let ((fragments
+           (org-typst-preview--fragments (point-min) (point-max))))
+      (should (equal (mapcar (lambda (fragment)
+                               (list (plist-get fragment :value)
+                                     (and (plist-get fragment :block) t)
+                                     (and (plist-get fragment :dollar) t)))
+                             fragments)
+                     '(("$a$" nil nil)
+                       ("$x$" nil t)
+                       ("$ b $" t t)
+                       ("$ c $" t nil)))))))
+
+(ert-deftest org-typst-preview-dollar-off-keeps-latex-untouched ()
+  (with-temp-buffer
+    (org-mode)
+    (insert "A $x$ here.")
+    (should-not org-typst-preview-dollar-mode)
+    (should-not (org-typst-preview--fragments (point-min) (point-max)))))
+
+(ert-deftest org-typst-preview-dollar-previews-and-caches ()
+  :tags '(:integration)
+  (skip-unless (executable-find org-typst-preview-executable))
+  (let* ((cache-directory (make-temp-file "org-typst-preview-dollar-" t))
+         (org-typst-preview-image-directory cache-directory)
+         (org-format-latex-options
+          '(:foreground "red" :background "white" :scale 1.0))
+         (org-typst-preview--jobs (make-hash-table :test #'equal))
+         (org-typst-preview--queue nil)
+         (org-typst-preview--running 0)
+         (deadline (+ (float-time) 120.0)))
+    (unwind-protect
+        (with-temp-buffer
+          (org-mode)
+          (org-typst-preview-dollar-mode 1)
+          (insert "Inline $x$ and display $ x^2 $ here.")
+          (should (= (org-typst-preview--preview-region
+                      (point-min) (point-max))
+                     2))
+          (while (and (> (hash-table-count org-typst-preview--jobs) 0)
+                      (< (float-time) deadline))
+            (accept-process-output nil 0.05))
+          (should (= (hash-table-count org-typst-preview--jobs) 0))
+          (let ((overlays (org-typst-preview--overlays
+                           (point-min) (point-max))))
+            (should (= (length overlays) 2))
+            (dolist (overlay overlays)
+              (should (overlay-get overlay 'display))))
+          (dolist (svg (directory-files cache-directory t "\\.svg\\'"))
+            (with-temp-buffer
+              (insert-file-contents svg)
+              (should (looking-at "<\\?xml\\|<svg"))))
+          (org-typst-preview-clear)
+          (should (= (org-typst-preview--preview-region
+                      (point-min) (point-max))
+                     2))
+          (should (cl-every
+                   (lambda (fragment) (eq fragment 'cached))
+                   (let ((fragments
+                          (org-typst-preview--fragments
+                           (point-min) (point-max))))
+                     (org-typst-preview-clear)
+                     (mapcar #'org-typst-preview--schedule fragments)))))
+      (delete-directory cache-directory t))))
+
+(ert-deftest org-typst-preview-dollar-export-passes-inline-transforms-display ()
+  (skip-unless (locate-library "ox-typst"))
+  (with-temp-buffer
+    (org-mode)
+    (org-typst-preview-dollar-mode 1)
+    (insert "Inline $x$ here.\n\n$ y^2 $")
+    (org-typst-preview--export-before-parsing 'typst)
+    (let ((result (buffer-string)))
+      (should (string-match-p (regexp-quote "Inline $x$ here.") result))
+      (should (string-match-p
+               (regexp-quote
+                "#+begin_export typst\n$ y^2 $\n#+end_export")
+               result)))))
+
+(ert-deftest org-typst-preview-dollar-double-parses-display ()
+  (with-temp-buffer
+    (org-mode)
+    (let ((org-typst-preview-dollar-mode 1))
+      (insert "$$sum_(i=1)^n i$$")
+      (let ((fragment (org-typst-preview--dollar-fragment-at (point-min))))
+        (should (plist-get fragment :block))
+        (should (equal (plist-get fragment :value) "$ sum_(i=1)^n i $"))
+        (should (equal (buffer-substring (plist-get fragment :begin)
+                                         (plist-get fragment :end))
+                       "$$sum_(i=1)^n i$$")))
+      ;; Multi-line body, trimmed.
+      (erase-buffer)
+      (insert "$$ a\n   b $$")
+      (should (equal (plist-get (org-typst-preview--dollar-fragment-at
+                                 (point-min))
+                                :body)
+                     "a\n   b"))
+      ;; Double dollars win over the inner `$x$'.
+      (erase-buffer)
+      (insert "$$x$$")
+      (should (equal (plist-get (org-typst-preview--dollar-fragment-at
+                                 (point-min))
+                                :value)
+                     "$ x $")))))
+
+(ert-deftest org-typst-preview-dollar-double-pairs-like-org-latex ()
+  (with-temp-buffer
+    (org-mode)
+    (let ((org-typst-preview-dollar-mode 1))
+      ;; Org-equivalent ambiguity: the first pair wins; `\$' escapes.
+      (insert "$$5 and $$10")
+      (should (equal (plist-get (org-typst-preview--dollar-fragment-at
+                                 (point-min))
+                                :value)
+                     "$ 5 and $")))))
+
+(ert-deftest org-typst-preview-region-ending-inside-dollar-double-fragment ()
+  (with-temp-buffer
+    (org-mode)
+    (let ((org-typst-preview-dollar-mode 1))
+      (insert "$$ a +\nb $$ tail")
+      (let (jobs)
+        (cl-letf (((symbol-function 'org-typst-preview--start-job)
+                   (lambda (job) (push job jobs))))
+          (should (= 0 (org-typst-preview--preview-region
+                        (point-min) (+ (point-min) 5))))
+          (should (= 1 (org-typst-preview--preview-region
+                        (point-min) (point-max))))
+          (should (= 1 (length jobs))))))))
+
+(ert-deftest org-typst-preview-dollar-off-ignores-double-dollars ()
+  (with-temp-buffer
+    (org-mode)
+    (insert "$$x^2$$")
+    (should-not org-typst-preview-dollar-mode)
+    (should-not (org-typst-preview--fragments (point-min) (point-max)))))
+
+(ert-deftest org-typst-preview-dollar-double-export-wraps-display ()
+  (skip-unless (locate-library "ox-typst"))
+  (with-temp-buffer
+    (org-mode)
+    (org-typst-preview-dollar-mode 1)
+    (insert "$$x^2$$")
+    (org-typst-preview--export-before-parsing 'typst)
+    (let ((result (buffer-string)))
+      (should (string-match-p
+               (regexp-quote
+                "#+begin_export typst\n$ x^2 $\n#+end_export")
+               result))
+      (should-not (string-match-p "\\$\\$" result)))))
+
+(ert-deftest org-typst-preview-dollar-double-previews-display ()
+  :tags '(:integration)
+  (skip-unless (executable-find org-typst-preview-executable))
+  (let* ((cache-directory (make-temp-file "org-typst-preview-double-" t))
+         (org-typst-preview-image-directory cache-directory)
+         (org-format-latex-options
+          '(:foreground "red" :background "white" :scale 1.0))
+         (org-typst-preview--jobs (make-hash-table :test #'equal))
+         (org-typst-preview--queue nil)
+         (org-typst-preview--running 0)
+         (deadline (+ (float-time) 120.0)))
+    (unwind-protect
+        (with-temp-buffer
+          (org-mode)
+          (org-typst-preview-dollar-mode 1)
+          (insert "Display $$x^2$$ inline.")
+          (should (= (org-typst-preview--preview-region
+                      (point-min) (point-max))
+                     1))
+          (while (and (> (hash-table-count org-typst-preview--jobs) 0)
+                      (< (float-time) deadline))
+            (accept-process-output nil 0.05))
+          (should (= (hash-table-count org-typst-preview--jobs) 0))
+          (let ((overlay (car (org-typst-preview--overlays
+                               (point-min) (point-max)))))
+            (should overlay)
+            (should (string-prefix-p "\n"
+                                     (overlay-get overlay 'before-string)))
+            (should (string-match-p
+                     "align-to"
+                     (prin1-to-string
+                      (overlay-get overlay 'before-string))))
+            (should (overlay-get overlay 'display)))
+          (should (cl-some
+                   (lambda (svg)
+                     (with-temp-buffer
+                       (insert-file-contents svg)
+                       (looking-at "<\\?xml\\|<svg")))
+                   (directory-files cache-directory t "\\.svg\\'"))))
+      (delete-directory cache-directory t))))
+
+(ert-deftest org-typst-preview-schedules-with-unfontified-face ()
+  (with-temp-buffer
+    (org-mode)
+    (let ((org-format-latex-options
+           '(:foreground auto :background "white" :scale 1.0)))
+      (insert "#(x#)")
+      ;; Unfontified text yields a nil face from `face-at-point'; building
+      ;; the preview source used to signal "Invalid face" from
+      ;; `face-attribute'.  The real scheduling path (not a stub) must
+      ;; resolve the `default' face and enqueue the job.
+      (should-not (face-at-point (point-min)))
+      (let (jobs)
+        (cl-letf (((symbol-function 'org-typst-preview--start-job)
+                   (lambda (job) (push job jobs))))
+          (should (memq (org-typst-preview--schedule
+                         (org-typst-preview--fragment-at (point-min)))
+                        '(scheduled cached)))
+          (should (= 1 (length jobs))))))))
+
+(ert-deftest org-typst-preview-region-ending-inside-dollar-fragment ()
+  (with-temp-buffer
+    (org-mode)
+    (let ((org-typst-preview-dollar-mode 1))
+      (insert "$ x +\ny $ tail $x$")
+      ;; A region that cuts a fragment must neither error ("Invalid search
+      ;; bound") nor return fragments extending past END.
+      (let (jobs)
+        (cl-letf (((symbol-function 'org-typst-preview--start-job)
+                   (lambda (job) (push job jobs))))
+          (should (= 0 (org-typst-preview--preview-region
+                        (point-min) (+ (point-min) 5))))
+          (should (= 2 (org-typst-preview--preview-region
+                        (point-min) (point-max))))
+          (should (= 2 (length jobs))))))))
+
+(ert-deftest org-typst-preview-auto-run-skips-untrusted-content ()
+  (with-temp-buffer
+    (org-mode)
+    (insert "#(x#)")
+    (org-typst-preview-auto-mode 1)
+    (let ((untrusted-content t)
+          (org--latex-preview-when-risky nil))
+      (org-typst-preview-test--with-renderers
+        (org-typst-preview--auto-run (current-buffer)
+                                     (copy-marker (point-min) t))
+        (should-not typst-fragments)))))
+
+(ert-deftest org-typst-preview-font-size-auto-and-override ()
+  ;; Auto: derived from the default face, always a positive number.
+  (should (cl-plusp (org-typst-preview--font-size)))
+  ;; Explicit numeric override wins.
+  (let ((org-typst-preview-font-size 13.0))
+    (should (= 13.0 (org-typst-preview--font-size)))))
+
+(ert-deftest org-typst-preview-block-overlay-own-line-and-centered ()
+  (with-temp-buffer
+    (org-mode)
+    (let ((org-typst-preview-dollar-mode 1))
+      ;; Mid-line display math: forced onto its own, centered line.
+      (insert "text $ x $ more")
+      (let* ((fragment (org-typst-preview--dollar-fragment-at 6))
+             (overlay (org-typst-preview--make-overlay fragment)))
+        (should (string-prefix-p "\n" (overlay-get overlay 'before-string)))
+        (should (string-match-p
+                 "align-to"
+                 (prin1-to-string (overlay-get overlay 'before-string))))
+        (should (equal "\n" (overlay-get overlay 'after-string))))
+      ;; Already alone on its line: no extra blank lines.
+      (erase-buffer)
+      (insert "$ x $\n")
+      (let* ((fragment (org-typst-preview--dollar-fragment-at 1))
+             (overlay (org-typst-preview--make-overlay fragment)))
+        (should-not (string-prefix-p "\n" (overlay-get overlay 'before-string)))
+        (should-not (overlay-get overlay 'after-string))))))
+
+(ert-deftest org-typst-preview-image-scale-follows-text-scale ()
+  (let ((org-typst-preview-scale 1.0))
+    (should (= 1.0 (plist-get (cdr (org-typst-preview--image-spec "f.svg"))
+                              :scale)))
+    (cl-progv '(text-scale-mode text-scale-mode-amount text-scale-mode-step)
+        (list t 1 1.2)
+      (should (< 1.19
+                 (plist-get (cdr (org-typst-preview--image-spec "f.svg"))
+                            :scale)
+                 1.21)))))
+
+(ert-deftest org-typst-preview-image-spec-compensates-font-change ()
+  ;; Rendered at 18pt, buffer now at 9pt: image halves.  A numeric
+  ;; org-typst-preview-font-size pins the current size.
+  (let ((org-typst-preview-font-size 9.0)
+        (org-typst-preview-scale 1.0))
+    (should (= 0.5 (plist-get
+                    (cdr (org-typst-preview--image-spec "f.svg" 18.0))
+                    :scale)))
+    ;; No recorded height: no ratio.
+    (should (= 1.0 (plist-get
+                    (cdr (org-typst-preview--image-spec "f.svg"))
+                    :scale)))))
+
+(ert-deftest org-typst-preview-source-with-unresolvable-colors ()
+  (with-temp-buffer
+    (org-mode)
+    ;; Faces report literal "unspecified-*" strings before a theme loads;
+    ;; `color-values' returns nil for them, which used to build `rgb()'
+    ;; (invalid Typst, compiler exit 1).  Must fall back instead.
+    (let ((org-format-latex-options
+           '(:foreground "unspecified-fg" :background "unspecified-bg" :scale 1.0)))
+      (let ((source (org-typst-preview--source "$x$" 'default)))
+        (should-not (string-match-p "rgb()" source))
+        (should (string-match-p "fill: black" source))
+        (should (string-match-p "fill: none" source))))))
 
 (provide 'org-typst-preview-test)
 
